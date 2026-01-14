@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sector Selector — The Market Mill</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root{ --mm-navy:#0B1F3B; --mm-green:#1FA46A; --mm-gold:#D6A84A; --mm-ink:#0b1220; }
+    .mm-card{ background: rgba(255,255,255,0.92); }
+    .mm-shadow{ box-shadow: 0 12px 30px rgba(0,0,0,0.12); }
+    .mm-gradient{
+      background: radial-gradient(1200px 600px at 20% 0%, rgba(31,164,106,0.18), transparent 55%),
+                  radial-gradient(900px 500px at 80% 20%, rgba(214,168,74,0.12), transparent 60%),
+                  linear-gradient(180deg, rgba(11,31,59,1) 0%, rgba(7,14,28,1) 100%);
+    }
+    .mm-btn{ background: linear-gradient(180deg, var(--mm-gold), #c8942f); }
+    .mm-chip{ border: 1px solid rgba(255,255,255,0.18); }
+    .mm-input{ background: rgba(255,255,255,0.92); border: 1px solid rgba(11,31,59,0.14); }
+    .mm-label{ color: rgba(11,31,59,0.88); }
+    .mm-table thead th{ background: rgba(11,31,59,0.06); }
+    .mm-link{ color: var(--mm-green); }
+    .mm-link:hover{ text-decoration: underline; }
+  </style>
+</head>
+<body class="mm-gradient min-h-screen">
+  <div class="max-w-7xl mx-auto px-4 py-10">
+    <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
+      <div>
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-xl bg-white/10 mm-chip flex items-center justify-center">
+            <div class="w-6 h-6 rounded-full" style="background: var(--mm-green)"></div>
+          </div>
+          <div class="text-white">
+            <div class="text-2xl font-semibold leading-tight">Sector Selector</div>
+            <div class="text-white/70 text-sm">by Marc‑Anthony Richardson, MBA, CPM</div>
+          </div>
+        </div>
+        <div class="text-white/70 mt-3 max-w-2xl text-sm">
+          Screen the entire U.S. market (NYSE/NASDAQ/AMEX + ADRs) by sector, market cap, beta, valuation, dividends, and key fundamentals.
+          Quotes are typically delayed on free tiers. This tool is for informational/educational use only.
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <a id="downloadBtn" class="mm-btn text-[var(--mm-navy)] font-semibold px-4 py-2 rounded-xl mm-shadow hover:opacity-95 transition"
+           href="#" title="Download current results as CSV">Download CSV</a>
+        <button id="runBtn" class="bg-[var(--mm-green)] text-white font-semibold px-4 py-2 rounded-xl mm-shadow hover:opacity-95 transition">
+          Run Screen
+        </button>
+      </div>
+    </div>
+
+    <div class="mt-8 grid grid-cols-1 lg:grid-cols-12 gap-4">
+      <div class="lg:col-span-4 mm-card rounded-2xl p-5 mm-shadow">
+        <div class="flex items-center justify-between">
+          <div class="text-[var(--mm-navy)] font-semibold">Filters</div>
+          <button id="resetBtn" class="text-xs text-[var(--mm-navy)]/70 hover:text-[var(--mm-navy)] underline">Reset</button>
+        </div>
+
+        <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div class="md:col-span-2">
+            <label class="mm-label text-xs font-semibold">Sector</label>
+            <select id="sector" class="mm-input w-full rounded-xl px-3 py-2 text-sm">
+              <option value="">All sectors</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="mm-label text-xs font-semibold">Exchange</label>
+            <select id="exchange" class="mm-input w-full rounded-xl px-3 py-2 text-sm">
+              <option value="">All</option>
+              <option value="NYSE">NYSE</option>
+              <option value="NASDAQ">NASDAQ</option>
+              <option value="AMEX">AMEX</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="mm-label text-xs font-semibold">Limit</label>
+            <input id="limit" type="number" min="1" max="250" value="100" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+
+          <div>
+            <label class="mm-label text-xs font-semibold">Market Cap Min ($)</label>
+            <input id="mcapMin" type="number" placeholder="e.g., 2000000000" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label class="mm-label text-xs font-semibold">Market Cap Max ($)</label>
+            <input id="mcapMax" type="number" placeholder="e.g., 10000000000" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+
+          <div>
+            <label class="mm-label text-xs font-semibold">Beta Min</label>
+            <input id="betaMin" type="number" step="0.01" placeholder="0.0" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label class="mm-label text-xs font-semibold">Beta Max</label>
+            <input id="betaMax" type="number" step="0.01" placeholder="3.0" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+
+          <div>
+            <label class="mm-label text-xs font-semibold">P/E Min</label>
+            <input id="peMin" type="number" step="0.1" placeholder="0" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label class="mm-label text-xs font-semibold">P/E Max</label>
+            <input id="peMax" type="number" step="0.1" placeholder="50" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+
+          <div>
+            <label class="mm-label text-xs font-semibold">Dividend Min (%)</label>
+            <input id="divMin" type="number" step="0.01" placeholder="0" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label class="mm-label text-xs font-semibold">Dividend Max (%)</label>
+            <input id="divMax" type="number" step="0.01" placeholder="10" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+
+          <div>
+            <label class="mm-label text-xs font-semibold">Volume Avg Min</label>
+            <input id="volMin" type="number" step="1" placeholder="100000" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label class="mm-label text-xs font-semibold">Price Min</label>
+            <input id="priceMin" type="number" step="0.01" placeholder="0" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+
+          <div>
+            <label class="mm-label text-xs font-semibold">Price Max</label>
+            <input id="priceMax" type="number" step="0.01" placeholder="1000" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+          </div>
+
+          <div class="md:col-span-2 mt-2 p-3 rounded-xl bg-[rgba(11,31,59,0.04)]">
+            <label class="flex items-center gap-2 text-sm text-[var(--mm-navy)]">
+              <input id="enrich" type="checkbox" class="scale-110" />
+              <span class="font-semibold">Advanced fundamentals (slower)</span>
+            </label>
+            <div class="text-xs text-[var(--mm-navy)]/70 mt-1">
+              Adds extra API calls for ratios/metrics and applies advanced filters below. Keep limit small on free tiers.
+            </div>
+
+            <div class="mt-3 grid grid-cols-2 gap-2">
+              <div>
+                <label class="mm-label text-xs font-semibold">Net Margin Min (%)</label>
+                <input id="netMarginMin" type="number" step="0.1" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+              </div>
+              <div>
+                <label class="mm-label text-xs font-semibold">ROE Min (%)</label>
+                <input id="roeMin" type="number" step="0.1" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+              </div>
+              <div>
+                <label class="mm-label text-xs font-semibold">Current Ratio Min</label>
+                <input id="currentRatioMin" type="number" step="0.01" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+              </div>
+              <div>
+                <label class="mm-label text-xs font-semibold">Debt/Equity Max</label>
+                <input id="deMax" type="number" step="0.01" class="mm-input w-full rounded-xl px-3 py-2 text-sm" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="status" class="mt-4 text-xs text-[var(--mm-navy)]/70"></div>
+      </div>
+
+      <div class="lg:col-span-8 mm-card rounded-2xl p-5 mm-shadow">
+        <div class="flex items-center justify-between">
+          <div class="text-[var(--mm-navy)] font-semibold">Results</div>
+          <div id="count" class="text-xs text-[var(--mm-navy)]/70"></div>
+        </div>
+
+        <div class="mt-4 overflow-auto rounded-xl border border-[rgba(11,31,59,0.10)]">
+          <table class="mm-table w-full text-sm">
+            <thead>
+              <tr class="text-left text-[var(--mm-navy)]/80">
+                <th class="px-3 py-2">Symbol</th>
+                <th class="px-3 py-2">Company</th>
+                <th class="px-3 py-2">Sector</th>
+                <th class="px-3 py-2">Mkt Cap</th>
+                <th class="px-3 py-2">Price</th>
+                <th class="px-3 py-2">Beta</th>
+                <th class="px-3 py-2">P/E</th>
+                <th class="px-3 py-2">Div</th>
+              </tr>
+            </thead>
+            <tbody id="tbody" class="text-[var(--mm-ink)]"></tbody>
+          </table>
+        </div>
+
+        <div class="mt-4 text-xs text-[var(--mm-navy)]/70">
+          Tip: Click any symbol to open its real-time (delayed) detail panel and chart.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal" class="hidden fixed inset-0 bg-black/55 backdrop-blur-sm">
+    <div class="max-w-5xl mx-auto mt-10 px-4">
+      <div class="mm-card rounded-2xl mm-shadow overflow-hidden">
+        <div class="flex items-center justify-between px-5 py-4 border-b border-[rgba(11,31,59,0.10)]">
+          <div>
+            <div id="mTitle" class="text-[var(--mm-navy)] font-semibold text-lg">Stock</div>
+            <div id="mSub" class="text-xs text-[var(--mm-navy)]/70"></div>
+          </div>
+          <button id="closeModal" class="px-3 py-1 rounded-lg bg-[rgba(11,31,59,0.06)] text-[var(--mm-navy)] hover:bg-[rgba(11,31,59,0.10)]">Close</button>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 p-5">
+          <div class="lg:col-span-8">
+            <canvas id="chart" height="120"></canvas>
+          </div>
+          <div class="lg:col-span-4">
+            <div class="text-[var(--mm-navy)] font-semibold">Snapshot</div>
+            <div id="mStats" class="mt-3 text-sm space-y-2 text-[var(--mm-ink)]"></div>
+            <div class="mt-4 text-xs text-[var(--mm-navy)]/70">
+              Data source: Financial Modeling Prep (free tier typically delayed). Not investment advice.
+            </div>
+          </div>
+
+          <div class="lg:col-span-12">
+            <div class="text-[var(--mm-navy)] font-semibold">Business description</div>
+            <div id="mDesc" class="mt-2 text-sm text-[var(--mm-ink)]/90 leading-relaxed"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
