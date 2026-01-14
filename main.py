@@ -21,13 +21,13 @@ APP_TITLE = "Sector Selector — by Marc-Anthony Richardson, MBA, CPM"
 MASSIVE_BASE = "https://api.massive.com"
 MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "").strip()
 
-# In-memory caching to reduce API calls on free/low tiers
+# In-memory caching (helps on low tiers)
 CACHE_TTL_SECONDS = 60 * 60 * 6  # 6 hours
 _universe_cache: Dict[str, Any] = {"ts": 0, "data": []}
 _spy_cache: Dict[str, Any] = {"ts": 0, "data": []}
 
-# Keep per-symbol snapshot/agg cached briefly
-_symbol_cache: Dict[str, Any] = {}  # sym -> {ts, snapshot, aggs}
+# Per-symbol cache
+_symbol_cache: Dict[str, Any] = {}  # sym -> {ts, data}
 SYMBOL_CACHE_SECONDS = 60 * 15  # 15 minutes
 
 
@@ -36,6 +36,9 @@ SYMBOL_CACHE_SECONDS = 60 * 15  # 15 minutes
 # ----------------------------
 app = FastAPI(title=APP_TITLE)
 templates = Jinja2Templates(directory="templates")
+
+# These folders must exist in your repo:
+# /static and /templates
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -58,7 +61,6 @@ async def massive_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any
 
     async with httpx.AsyncClient(timeout=45) as client:
         r = await client.get(url, params=params)
-        # Raise for non-2xx to surface 401/403 clearly
         r.raise_for_status()
         return r.json()
 
@@ -72,9 +74,15 @@ def _to_float(x) -> Optional[float]:
         return None
 
 
-def _passes_minmax(val: Optional[float], min_v: Optional[float], max_v: Optional[float]) -> bool:
+def _passes_minmax_optional(val: Optional[float], min_v: Optional[float], max_v: Optional[float]) -> bool:
+    """
+    If no min/max provided, pass even if val is None.
+    If min/max provided and val is None, fail (because we can't verify).
+    """
+    if min_v is None and max_v is None:
+        return True
     if val is None:
-        return False if (min_v is not None or max_v is not None) else True
+        return False
     if min_v is not None and val < min_v:
         return False
     if max_v is not None and val > max_v:
@@ -87,14 +95,12 @@ def _passes_minmax(val: Optional[float], min_v: Optional[float], max_v: Optional
 # ----------------------------
 async def get_ticker_universe(limit: int = 1000) -> List[Dict[str, Any]]:
     """
-    Pull a universe of US stock tickers. We cache it because it’s large.
+    Pull a universe of active US stock tickers. Cached.
     """
     now = int(time.time())
     if _universe_cache["data"] and (now - _universe_cache["ts"]) < CACHE_TTL_SECONDS:
         return _universe_cache["data"]
 
-    # Reference tickers endpoint (paged). Many plans allow reference data.
-    # We start simple with one page. Later we can paginate/crawl to “all”.
     js = await massive_get(
         "/v3/reference/tickers",
         {
@@ -104,6 +110,7 @@ async def get_ticker_universe(limit: int = 1000) -> List[Dict[str, Any]]:
             "limit": int(limit),
         },
     )
+
     rows = js.get("results") or []
     universe = []
     for r in rows:
@@ -127,7 +134,7 @@ async def get_ticker_universe(limit: int = 1000) -> List[Dict[str, Any]]:
 
 async def get_snapshot(symbol: str) -> Dict[str, Any]:
     """
-    Snapshot gives a lot of quick fields (price, volume, sometimes fundamentals including market cap/dividends).
+    Snapshot endpoint (may vary by plan). Best-effort.
     """
     symbol = symbol.upper().strip()
     js = await massive_get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}", {})
@@ -136,11 +143,10 @@ async def get_snapshot(symbol: str) -> Dict[str, Any]:
 
 async def get_aggs_daily(symbol: str, days: int = 260) -> List[Tuple[int, float, float]]:
     """
-    Daily aggregates: returns list of (t_ms, close, volume) tuples.
+    Daily aggregates: returns list of (t_ms, close, volume)
     """
     symbol = symbol.upper().strip()
     end = datetime.now(timezone.utc).date()
-    # buffer for weekends/holidays
     start = (datetime.now(timezone.utc) - timedelta(days=int(days * 1.7))).date()
 
     js = await massive_get(
@@ -148,7 +154,6 @@ async def get_aggs_daily(symbol: str, days: int = 260) -> List[Tuple[int, float,
         {"adjusted": "true", "sort": "asc", "limit": 50000},
     )
     results = js.get("results") or []
-
     out: List[Tuple[int, float, float]] = []
     for r in results:
         t = r.get("t")
@@ -158,7 +163,6 @@ async def get_aggs_daily(symbol: str, days: int = 260) -> List[Tuple[int, float,
             continue
         out.append((int(t), float(c), float(v) if v is not None else 0.0))
 
-    # keep last ~days points
     if len(out) > days:
         out = out[-days:]
     return out
@@ -166,7 +170,7 @@ async def get_aggs_daily(symbol: str, days: int = 260) -> List[Tuple[int, float,
 
 async def get_spy_prices(days: int = 260) -> List[Tuple[int, float]]:
     """
-    Cached SPY closes for beta calculation.
+    Cached SPY closes for beta computation.
     """
     now = int(time.time())
     if _spy_cache["data"] and (now - _spy_cache["ts"]) < CACHE_TTL_SECONDS:
@@ -220,7 +224,7 @@ def compute_beta(symbol_aggs: List[Tuple[int, float, float]], spy: List[Tuple[in
 
 def compute_momentum_3m(symbol_aggs: List[Tuple[int, float, float]]) -> Optional[float]:
     """
-    3M momentum approx = last close / close 63 trading days ago - 1 (percent).
+    3M momentum approx = last close / close 63 trading days ago - 1 (percent)
     """
     if len(symbol_aggs) < 70:
         return None
@@ -233,7 +237,7 @@ def compute_momentum_3m(symbol_aggs: List[Tuple[int, float, float]]) -> Optional
 
 def extract_snapshot_fields(symbol: str, snapshot_json: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Snapshot schema can vary by plan; we defensively pull what’s available.
+    Snapshot schema varies; we defensively extract price, volume, market cap, dividends if present.
     """
     tk = snapshot_json.get("ticker") or snapshot_json.get("results") or snapshot_json
     day = tk.get("day") or {}
@@ -255,13 +259,13 @@ def extract_snapshot_fields(symbol: str, snapshot_json: Dict[str, Any]) -> Dict[
         "marketCap": _to_float(market_cap),
         "dividendYield": _to_float(dividend_yield),
         "dividendCash": _to_float(dividend_cash),
-        "rawFundamentals": fundamentals,
+        "fundamentals": fundamentals,
     }
 
 
 async def get_symbol_bundle(symbol: str, days: int = 260) -> Dict[str, Any]:
     """
-    Cached snapshot + aggs bundle per symbol (reduces repeated calls).
+    Cached bundle: snapshot + aggregates (best-effort).
     """
     now = int(time.time())
     sym = symbol.upper().strip()
@@ -269,12 +273,22 @@ async def get_symbol_bundle(symbol: str, days: int = 260) -> Dict[str, Any]:
     if cached and (now - cached["ts"]) < SYMBOL_CACHE_SECONDS:
         return cached["data"]
 
-    snap = await get_snapshot(sym)
-    aggs = await get_aggs_daily(sym, days=days)
+    data: Dict[str, Any] = {"snapshot": None, "aggs": None}
 
-    bundle = {"snapshot": snap, "aggs": aggs}
-    _symbol_cache[sym] = {"ts": now, "data": bundle}
-    return bundle
+    # Snapshot best-effort
+    try:
+        data["snapshot"] = await get_snapshot(sym)
+    except Exception:
+        data["snapshot"] = None
+
+    # Aggs best-effort
+    try:
+        data["aggs"] = await get_aggs_daily(sym, days=days)
+    except Exception:
+        data["aggs"] = None
+
+    _symbol_cache[sym] = {"ts": now, "data": data}
+    return data
 
 
 # ----------------------------
@@ -296,44 +310,41 @@ async def health():
 @app.get("/api/stock/{symbol}")
 async def stock_detail(symbol: str):
     """
-    Detail endpoint for your ticker modal:
-    returns snapshot + candles-like arrays for charting
+    Detail endpoint for ticker modal: snapshot + chart arrays from aggregates.
     """
     err = _missing_key_error()
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
 
     sym = symbol.upper().strip()
+
     try:
         bundle = await get_symbol_bundle(sym, days=520)
-        snap_fields = extract_snapshot_fields(sym, bundle["snapshot"])
+        snap = bundle.get("snapshot")
+        aggs = bundle.get("aggs") or []
 
-        # Convert aggs to candle-like arrays for chart.js
-        t_arr = [t for (t, _c, _v) in bundle["aggs"]]
-        c_arr = [_c for (_t, _c, _v) in bundle["aggs"]]
-        v_arr = [_v for (_t, _c, _v) in bundle["aggs"]]
-
-        return {
-            "ok": True,
-            "symbol": sym,
-            "snapshot": snap_fields,
-            "candles": {"t": t_arr, "c": c_arr, "v": v_arr},
+        snap_fields = extract_snapshot_fields(sym, snap) if snap else {
+            "symbol": sym, "price": None, "volume": None, "marketCap": None,
+            "dividendYield": None, "dividendCash": None, "fundamentals": {}
         }
-    except httpx.HTTPStatusError as e:
-        return JSONResponse(status_code=502, content={"ok": False, "error": f"Upstream Massive error: {str(e)}"})
+
+        t_arr = [t for (t, _c, _v) in aggs]
+        c_arr = [_c for (_t, _c, _v) in aggs]
+        v_arr = [_v for (_t, _c, _v) in aggs]
+
+        return {"ok": True, "symbol": sym, "snapshot": snap_fields, "candles": {"t": t_arr, "c": c_arr, "v": v_arr}}
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
 @app.get("/api/screener")
 async def screener(
-    # Core screen inputs
+    # Core filters
     market_cap_min: Optional[float] = Query(None),
     market_cap_max: Optional[float] = Query(None),
     beta_min: Optional[float] = Query(None),
     beta_max: Optional[float] = Query(None),
-    pe_min: Optional[float] = Query(None),              # may not be available on your tier; kept for UI compatibility
-    pe_max: Optional[float] = Query(None),              # (we won’t filter if we can’t compute it)
     dividend_min: Optional[float] = Query(None),
     dividend_max: Optional[float] = Query(None),
     price_min: Optional[float] = Query(None),
@@ -341,13 +352,13 @@ async def screener(
     volume_min: Optional[float] = Query(None),
     momentum_3m_min: Optional[float] = Query(None, description="3-month momentum minimum (percent)."),
     limit: int = Query(100, ge=1, le=200),
+    debug: bool = Query(False),
 ):
     """
-    Screener without Massive paid ratios endpoint:
-      - Universe (first 1000 active US stock tickers)
-      - Snapshot + aggs for a bounded subset
-      - Compute beta vs SPY
-      - Compute 3M momentum
+    Screener that avoids paywalled ratios endpoint:
+      - Universe (first 1000 active tickers)
+      - Snapshot (price/volume/mkt cap/dividends if available)
+      - Aggregates only if needed (beta/momentum)
       - Filter locally
     """
     err = _missing_key_error()
@@ -359,82 +370,105 @@ async def screener(
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"Failed to load ticker universe: {str(e)}"}, status_code=500)
 
-    # Fetch SPY for beta only if user is using beta filters
+    need_beta = (beta_min is not None) or (beta_max is not None)
+    need_momentum = (momentum_3m_min is not None)
+
     spy = None
-    if beta_min is not None or beta_max is not None:
+    if need_beta:
         try:
             spy = await get_spy_prices(days=260)
         except Exception as e:
             return JSONResponse({"ok": False, "error": f"Failed to fetch SPY for beta: {str(e)}"}, status_code=500)
 
-    # Process a subset to stay within low-tier limits; tighten filters for best results.
-    # You can increase this later after adding DB caching.
+    # Process a subset to stay inside low-tier limits
     subset = universe[:250]
 
     sem = asyncio.Semaphore(10)
 
     async def process_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         sym = row["symbol"]
+
         async with sem:
-            try:
-                bundle = await get_symbol_bundle(sym, days=260)
-                snap_fields = extract_snapshot_fields(sym, bundle["snapshot"])
-                aggs = bundle["aggs"]
+            bundle = await get_symbol_bundle(sym, days=260)
 
-                mom3 = compute_momentum_3m(aggs)
-                b = compute_beta(aggs, spy) if spy is not None else None
+            snap_json = bundle.get("snapshot")
+            aggs = bundle.get("aggs")
 
-                out = {
-                    "symbol": sym,
-                    "name": row.get("name", ""),
-                    "exchange": row.get("primary_exchange", ""),
-                    "industry": row.get("sic_description", ""),
-                    "price": snap_fields.get("price"),
-                    "volume": snap_fields.get("volume"),
-                    "marketCap": snap_fields.get("marketCap"),
-                    "dividendYield": snap_fields.get("dividendYield"),
-                    "dividendCash": snap_fields.get("dividendCash"),
-                    "beta": b,
-                    "momentum3m": mom3,
-                    # Placeholders (kept so UI doesn’t break if it references them)
-                    "pe": None,
-                }
-                return out
-            except Exception:
+            # If we got nothing at all, skip
+            if snap_json is None and aggs is None:
                 return None
+
+            snap_fields = extract_snapshot_fields(sym, snap_json) if snap_json else {
+                "symbol": sym, "price": None, "volume": None, "marketCap": None,
+                "dividendYield": None, "dividendCash": None, "fundamentals": {}
+            }
+
+            # Use aggregates to fill missing price/volume if snapshot doesn't have them
+            if aggs and (snap_fields.get("price") is None or snap_fields.get("volume") is None):
+                # last day from aggs
+                snap_fields["price"] = snap_fields.get("price") or aggs[-1][1]
+                snap_fields["volume"] = snap_fields.get("volume") or aggs[-1][2]
+
+            b = None
+            mom3 = None
+            if need_beta and aggs and spy:
+                b = compute_beta(aggs, spy)
+            if need_momentum and aggs:
+                mom3 = compute_momentum_3m(aggs)
+            elif aggs:
+                # Compute momentum anyway (nice to show), but don't require it
+                mom3 = compute_momentum_3m(aggs)
+
+            return {
+                "symbol": sym,
+                "name": row.get("name", ""),
+                "exchange": row.get("primary_exchange", ""),
+                "industry": row.get("sic_description", ""),
+                "price": snap_fields.get("price"),
+                "volume": snap_fields.get("volume"),
+                "marketCap": snap_fields.get("marketCap"),
+                "dividendYield": snap_fields.get("dividendYield"),
+                "dividendCash": snap_fields.get("dividendCash"),
+                "beta": b,
+                "momentum3m": mom3,
+            }
 
     processed = await asyncio.gather(*(process_row(r) for r in subset))
 
     results: List[Dict[str, Any]] = []
+    dropped = 0
+
     for r in processed:
         if not r:
+            dropped += 1
             continue
 
-        # Apply filters (skip a filter if value isn’t available)
-        if market_cap_min is not None or market_cap_max is not None:
-            if not _passes_minmax(r.get("marketCap"), market_cap_min, market_cap_max):
-                continue
-
-        if price_min is not None or price_max is not None:
-            if not _passes_minmax(r.get("price"), price_min, price_max):
-                continue
+        # Apply filters (only enforce if user provided them)
+        if not _passes_minmax_optional(r.get("marketCap"), market_cap_min, market_cap_max):
+            continue
+        if not _passes_minmax_optional(r.get("price"), price_min, price_max):
+            continue
 
         if volume_min is not None:
             v = r.get("volume")
             if v is None or v < volume_min:
                 continue
 
+        # Dividend filter: only enforce if user set it; missing dividends fail only when filtering
         if dividend_min is not None or dividend_max is not None:
             dy = r.get("dividendYield")
-            # If dividend data missing, it fails dividend filter by design
-            if not _passes_minmax(dy, dividend_min, dividend_max):
+            if dy is None:
+                continue
+            if not _passes_minmax_optional(dy, dividend_min, dividend_max):
                 continue
 
-        if beta_min is not None or beta_max is not None:
+        # Beta filter: only enforce if user set it
+        if need_beta:
             b = r.get("beta")
-            if not _passes_minmax(b, beta_min, beta_max):
+            if not _passes_minmax_optional(b, beta_min, beta_max):
                 continue
 
+        # Momentum filter: only enforce if user set it
         if momentum_3m_min is not None:
             m = r.get("momentum3m")
             if m is None or m < momentum_3m_min:
@@ -442,14 +476,40 @@ async def screener(
 
         results.append(r)
 
-    # Truncate to limit after filtering
     results = results[:limit]
+
+    if debug:
+        # Show what we're actually getting back so we can tune the app to your plan
+        sample = []
+        for x in processed[:20]:
+            if x:
+                sample.append({
+                    "symbol": x["symbol"],
+                    "price": x.get("price"),
+                    "marketCap": x.get("marketCap"),
+                    "dividendYield": x.get("dividendYield"),
+                    "volume": x.get("volume"),
+                    "beta": x.get("beta"),
+                    "momentum3m": x.get("momentum3m"),
+                })
+        return {
+            "ok": True,
+            "count": len(results),
+            "results": results,
+            "debugInfo": {
+                "processed_total": len(processed),
+                "dropped_none": dropped,
+                "sample_first_20_processed": sample,
+                "need_beta": need_beta,
+                "need_momentum": need_momentum,
+            }
+        }
 
     return {
         "ok": True,
         "count": len(results),
-        "results": results,   # common frontend key
-        "data": results,      # also provided for flexibility
+        "results": results,
+        "data": results,
         "note": "Using Massive reference + snapshot + aggregates (ratios endpoint not enabled on this plan). Tighten filters for best results.",
         "coverage": "First 250 active US tickers (expandable with caching/pagination).",
     }
@@ -469,7 +529,7 @@ async def export_csv(
     momentum_3m_min: Optional[float] = Query(None),
     limit: int = Query(200, ge=1, le=200),
 ):
-    # Reuse screener, then export results
+    # Reuse screener
     resp = await screener(
         market_cap_min=market_cap_min,
         market_cap_max=market_cap_max,
@@ -482,6 +542,7 @@ async def export_csv(
         volume_min=volume_min,
         momentum_3m_min=momentum_3m_min,
         limit=limit,
+        debug=False,
     )
 
     if isinstance(resp, JSONResponse):
@@ -513,5 +574,5 @@ async def export_csv(
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
     )
