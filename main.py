@@ -1,8 +1,9 @@
 import os
 import csv
 import io
-from datetime import datetime
-from typing import Optional, Dict, Any
+import asyncio
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
 from fastapi import FastAPI, Request, Query
@@ -12,8 +13,9 @@ from fastapi.templating import Jinja2Templates
 
 APP_NAME = "Sector Selector — by Marc-Anthony Richardson, MBA, CPM"
 
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
-FMP_KEY = os.getenv("FMP_API_KEY", "").strip()
+# Massive (Polygon rebrand) base
+MASSIVE_BASE = "https://api.massive.com"
+MASSIVE_KEY = os.getenv("MASSIVE_API_KEY", "").strip()
 
 app = FastAPI(title=APP_NAME)
 templates = Jinja2Templates(directory="templates")
@@ -21,16 +23,20 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 def _require_key() -> Optional[str]:
-    if not FMP_KEY:
-        return "Missing API key. Set environment variable FMP_API_KEY before running."
+    if not MASSIVE_KEY:
+        return "Missing API key. Set environment variable MASSIVE_API_KEY before running."
     return None
 
 
-async def fmp_get(path: str, params: Dict[str, Any]) -> Any:
+async def massive_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """
+    Massive supports apiKey in query string.
+    Docs: https://massive.com/docs/rest/quickstart
+    """
     params = dict(params or {})
-    params["apikey"] = FMP_KEY
-    url = f"{FMP_BASE}{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
+    params["apiKey"] = MASSIVE_KEY
+    url = f"{MASSIVE_BASE}{path}"
+    async with httpx.AsyncClient(timeout=40) as client:
         r = await client.get(url, params=params)
         r.raise_for_status()
         return r.json()
@@ -46,11 +52,17 @@ async def health():
     err = _require_key()
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
-    return {"ok": True, "provider": "Financial Modeling Prep", "delayed_quotes": "Typically ~15 min (free tiers vary)"}
+    return {
+        "ok": True,
+        "provider": "Massive.com",
+        "auth": "apiKey query param or Authorization header supported by Massive",
+        "base": MASSIVE_BASE,
+    }
 
 
 @app.get("/api/sectors")
 async def sectors():
+    # Keep your 11-sector UI list (we can refine classification later)
     return {
         "sectors": [
             "Energy","Materials","Industrials","Consumer Discretionary","Consumer Staples",
@@ -60,213 +72,98 @@ async def sectors():
     }
 
 
+def _approx_sector_from_sic(sic_desc: str) -> str:
+    """
+    Massive reference endpoints often return SIC descriptions.
+    This is a lightweight heuristic mapping so your UI can still show a 'sector'.
+    """
+    s = (sic_desc or "").lower()
+    if any(k in s for k in ["oil", "gas", "petroleum", "drilling", "pipeline", "energy"]):
+        return "Energy"
+    if any(k in s for k in ["bank", "insurance", "broker", "lending", "financial"]):
+        return "Financials"
+    if any(k in s for k in ["software", "semiconductor", "computer", "technology", "it "]):
+        return "Information Technology"
+    if any(k in s for k in ["telecom", "media", "broadcast", "interactive", "communications"]):
+        return "Communication Services"
+    if any(k in s for k in ["pharma", "medical", "hospital", "biotech", "health"]):
+        return "Health Care"
+    if any(k in s for k in ["retail", "apparel", "consumer", "restaurant", "auto", "travel"]):
+        return "Consumer Discretionary"
+    if any(k in s for k in ["food", "beverage", "household", "tobacco", "staples"]):
+        return "Consumer Staples"
+    if any(k in s for k in ["utility", "electric", "water", "gas utility"]):
+        return "Utilities"
+    if any(k in s for k in ["reit", "real estate", "property", "mortgage"]):
+        return "Real Estate"
+    if any(k in s for k in ["chemical", "steel", "mining", "materials", "paper", "lumber"]):
+        return "Materials"
+    return "Industrials"
+
+
+async def _aggs_daily(symbol: str, days: int) -> List[Tuple[str, float]]:
+    """
+    Fetch daily close prices for the past N calendar days and return list of (date, close).
+    Uses v2 aggs endpoint.
+    """
+    end = datetime.now(timezone.utc).date()
+    start = (datetime.now(timezone.utc) - timedelta(days=int(days * 1.6))).date()  # buffer for weekends/holidays
+    path = f"/v2/aggs/ticker/{symbol}/range/1/day/{start}/{end}"
+    js = await massive_get(path, {"adjusted": "true", "sort": "asc", "limit": 50000})
+    results = js.get("results") or []
+    out = []
+    for r in results[-days:]:
+        # t is ms epoch
+        ts = r.get("t")
+        c = r.get("c")
+        if ts is None or c is None:
+            continue
+        d = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date().isoformat()
+        out.append((d, float(c)))
+    return out
+
+
+def _beta_from_prices(prices: List[Tuple[str, float]], spy_prices: List[Tuple[str, float]]) -> Optional[float]:
+    """
+    Compute beta from aligned daily returns.
+    """
+    if len(prices) < 40 or len(spy_prices) < 40:
+        return None
+
+    p_map = {d: c for d, c in prices}
+    s_map = {d: c for d, c in spy_prices}
+    dates = sorted(set(p_map.keys()) & set(s_map.keys()))
+    if len(dates) < 40:
+        return None
+
+    # daily returns
+    pr = []
+    sr = []
+    for i in range(1, len(dates)):
+        d0, d1 = dates[i - 1], dates[i]
+        p0, p1 = p_map[d0], p_map[d1]
+        s0, s1 = s_map[d0], s_map[d1]
+        if p0 <= 0 or s0 <= 0:
+            continue
+        pr.append((p1 / p0) - 1.0)
+        sr.append((s1 / s0) - 1.0)
+
+    n = min(len(pr), len(sr))
+    if n < 30:
+        return None
+    pr = pr[-n:]
+    sr = sr[-n:]
+
+    mean_p = sum(pr) / n
+    mean_s = sum(sr) / n
+    cov = sum((pr[i] - mean_p) * (sr[i] - mean_s) for i in range(n)) / (n - 1)
+    var_s = sum((sr[i] - mean_s) ** 2 for i in range(n)) / (n - 1)
+    if var_s <= 0:
+        return None
+    return cov / var_s
+
+
 @app.get("/api/screener")
 async def screener(
     sector: Optional[str] = None,
-    exchange: Optional[str] = Query(default=None, description="NYSE, NASDAQ, AMEX, etc. Leave blank for all."),
-    market_cap_min: Optional[float] = None,
-    market_cap_max: Optional[float] = None,
-    beta_min: Optional[float] = None,
-    beta_max: Optional[float] = None,
-    pe_min: Optional[float] = None,
-    pe_max: Optional[float] = None,
-    dividend_min: Optional[float] = None,
-    dividend_max: Optional[float] = None,
-    volume_min: Optional[float] = None,
-    price_min: Optional[float] = None,
-    price_max: Optional[float] = None,
-    limit: int = 100,
-    enrich: bool = False,
-    net_margin_min: Optional[float] = None,
-    current_ratio_min: Optional[float] = None,
-    roe_min: Optional[float] = None,
-    debt_to_equity_max: Optional[float] = None,
-):
-    err = _require_key()
-    if err:
-        return JSONResponse({"ok": False, "error": err}, status_code=400)
-
-    limit = max(1, min(int(limit), 250))
-    params: Dict[str, Any] = {"limit": limit}
-
-    if sector: params["sector"] = sector
-    if exchange: params["exchange"] = exchange
-
-    if market_cap_min is not None: params["marketCapMoreThan"] = int(market_cap_min)
-    if market_cap_max is not None: params["marketCapLowerThan"] = int(market_cap_max)
-
-    if beta_min is not None: params["betaMoreThan"] = beta_min
-    if beta_max is not None: params["betaLowerThan"] = beta_max
-
-    if pe_min is not None: params["peMoreThan"] = pe_min
-    if pe_max is not None: params["peLowerThan"] = pe_max
-
-    if dividend_min is not None: params["dividendMoreThan"] = dividend_min
-    if dividend_max is not None: params["dividendLowerThan"] = dividend_max
-
-    if volume_min is not None: params["volumeMoreThan"] = volume_min
-    if price_min is not None: params["priceMoreThan"] = price_min
-    if price_max is not None: params["priceLowerThan"] = price_max
-
-    try:
-        results = await fmp_get("/stock-screener", params)
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"Screener request failed: {str(e)}"}, status_code=500)
-
-    if not isinstance(results, list):
-        return {"ok": True, "count": 0, "data": [], "note": "No results"}
-
-    data = []
-    for r in results:
-        data.append({
-            "symbol": r.get("symbol"),
-            "companyName": r.get("companyName") or r.get("company") or "",
-            "sector": r.get("sector") or "",
-            "industry": r.get("industry") or "",
-            "exchange": r.get("exchangeShortName") or r.get("exchange") or "",
-            "price": r.get("price"),
-            "marketCap": r.get("marketCap"),
-            "beta": r.get("beta"),
-            "pe": r.get("pe"),
-            "dividendYield": r.get("dividendYield") or r.get("lastAnnualDividend"),
-            "volumeAvg": r.get("volumeAvg") or r.get("volAvg") or r.get("volume"),
-        })
-
-    if not enrich:
-        return {"ok": True, "count": len(data), "data": data, "enriched": False}
-
-    enriched = []
-    for item in data:
-        sym = (item.get("symbol") or "").upper().strip()
-        if not sym:
-            continue
-        try:
-            profile = await fmp_get(f"/profile/{sym}", {})
-            ratios_ttm = await fmp_get(f"/ratios-ttm/{sym}", {})
-        except Exception:
-            profile, ratios_ttm = [], []
-
-        p0 = profile[0] if isinstance(profile, list) and profile else {}
-        r0 = ratios_ttm[0] if isinstance(ratios_ttm, list) and ratios_ttm else {}
-
-        net_margin = r0.get("netProfitMarginTTM")
-        if net_margin is not None and net_margin <= 1.5:
-            net_margin *= 100.0
-        roe = r0.get("returnOnEquityTTM")
-        if roe is not None and roe <= 1.5:
-            roe *= 100.0
-        current_ratio = r0.get("currentRatioTTM")
-        debt_to_equity = r0.get("debtEquityRatioTTM")
-
-        item2 = dict(item)
-        item2.update({
-            "country": p0.get("country"),
-            "currency": p0.get("currency"),
-            "website": p0.get("website"),
-            "description": p0.get("description"),
-            "netMarginTTM": net_margin,
-            "roeTTM": roe,
-            "currentRatioTTM": current_ratio,
-            "debtToEquityTTM": debt_to_equity,
-        })
-
-        def pass_min(val, mn):
-            return mn is None or (val is not None and val >= mn)
-        def pass_max(val, mx):
-            return mx is None or (val is not None and val <= mx)
-
-        ok = True
-        ok = ok and pass_min(item2.get("netMarginTTM"), net_margin_min)
-        ok = ok and pass_min(item2.get("currentRatioTTM"), current_ratio_min)
-        ok = ok and pass_min(item2.get("roeTTM"), roe_min)
-        ok = ok and pass_max(item2.get("debtToEquityTTM"), debt_to_equity_max)
-
-        if ok:
-            enriched.append(item2)
-
-    return {"ok": True, "count": len(enriched), "data": enriched, "enriched": True, "note": "Enrichment uses extra API calls; keep limit small on free tiers."}
-
-
-@app.get("/api/stock/{symbol}")
-async def stock_detail(symbol: str):
-    err = _require_key()
-    if err:
-        return JSONResponse({"ok": False, "error": err}, status_code=400)
-    symbol = symbol.upper().strip()
-
-    try:
-        profile = await fmp_get(f"/profile/{symbol}", {})
-        quote = await fmp_get(f"/quote/{symbol}", {})
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"Detail request failed: {str(e)}"}, status_code=500)
-
-    p0 = profile[0] if isinstance(profile, list) and profile else {}
-    q0 = quote[0] if isinstance(quote, list) and quote else {}
-    return {"ok": True, "profile": p0, "quote": q0, "symbol": symbol}
-
-
-@app.get("/api/history/{symbol}")
-async def history(symbol: str, days: int = 220):
-    err = _require_key()
-    if err:
-        return JSONResponse({"ok": False, "error": err}, status_code=400)
-    symbol = symbol.upper().strip()
-    days = max(30, min(int(days), 1000))
-
-    try:
-        hist = await fmp_get(f"/historical-price-full/{symbol}", {"timeseries": days, "serietype": "line"})
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"History request failed: {str(e)}"}, status_code=500)
-
-    historical = hist.get("historical", []) if isinstance(hist, dict) else []
-    historical = sorted(historical, key=lambda x: x.get("date", ""))
-    return {"ok": True, "symbol": symbol, "historical": historical}
-
-
-@app.get("/api/export")
-async def export_csv(
-    sector: Optional[str] = None,
-    exchange: Optional[str] = None,
-    market_cap_min: Optional[float] = None,
-    market_cap_max: Optional[float] = None,
-    beta_min: Optional[float] = None,
-    beta_max: Optional[float] = None,
-    pe_min: Optional[float] = None,
-    pe_max: Optional[float] = None,
-    dividend_min: Optional[float] = None,
-    dividend_max: Optional[float] = None,
-    volume_min: Optional[float] = None,
-    price_min: Optional[float] = None,
-    price_max: Optional[float] = None,
-    limit: int = 200
-):
-    resp = await screener(
-        sector=sector, exchange=exchange,
-        market_cap_min=market_cap_min, market_cap_max=market_cap_max,
-        beta_min=beta_min, beta_max=beta_max,
-        pe_min=pe_min, pe_max=pe_max,
-        dividend_min=dividend_min, dividend_max=dividend_max,
-        volume_min=volume_min,
-        price_min=price_min, price_max=price_max,
-        limit=limit,
-        enrich=False
-    )
-    if isinstance(resp, JSONResponse):
-        return resp
-    data = resp.get("data", []) if isinstance(resp, dict) else []
-
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=[
-        "symbol","companyName","sector","industry","exchange","price","marketCap","beta","pe","dividendYield","volumeAvg"
-    ])
-    writer.writeheader()
-    for row in data:
-        writer.writerow(row)
-    output.seek(0)
-
-    filename = f"SectorSelector_results_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.csv"
-    return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
+    exchange: Optional[str] = Query(default=None, description="Optional. Used only when available via ref
